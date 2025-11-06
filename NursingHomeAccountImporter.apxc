@@ -1,0 +1,149 @@
+/**
+ * This Queueable Apex class reads a mock CSV of contacts from a Static Resource.
+ * It finds Accounts in Arizona ('AZ') and creates new administrator contacts,
+ * fulfilling the specific requirements of the assignment.
+ *
+ * **FINAL VERSION 2.0 - USES STANDARD BILLINGSTATE FIELD**
+ */
+public class NursingHomeContactImporter implements Queueable {
+
+    private static final Integer COL_CNN = 0;
+    private static final Integer COL_NAME = 1;
+    private static final Integer COL_TITLE = 2;
+
+    public void execute(QueueableContext context) {
+        
+        // 1. Get the Contact CSV from Static Resources
+        StaticResource csvResource;
+        try {
+            csvResource = [SELECT Body FROM StaticResource WHERE Name = 'ltc_contacts_data' LIMIT 1];
+        } catch (Exception e) {
+            System.debug('ERROR: Could not find Static Resource named "ltc_contacts_data". ' + e.getMessage());
+            return;
+        }
+        
+        // 2. Find all AZ Accounts and map them by their CNN
+        // ** (THE FIX IS HERE): We now query for BillingState = 'AZ' instead of the custom field. **
+        Map<String, Id> cnnToAccountId = new Map<String, Id>();
+        for (Account acc : [SELECT Id, CMS_Certification_Number__c 
+                            FROM Account 
+                            WHERE BillingState = 'AZ'  // <-- THIS IS THE ONLY LINE THAT CHANGED
+                            AND CMS_Certification_Number__c != null]) {
+            cnnToAccountId.put(acc.CMS_Certification_Number__c, acc.Id);
+        }
+
+        if (cnnToAccountId.isEmpty()) {
+            System.debug('No AZ accounts found to process (BillingState = AZ). This is a problem with your Step 1 data.');
+            return;
+        }
+
+        // 3. Get all *existing* contacts on those AZ accounts for checking
+        Set<Id> azAccountIds = new Set<Id>(cnnToAccountId.values());
+        Map<Id, List<Contact>> existingContactsByAcct = new Map<Id, List<Contact>>();
+        
+        for (Contact c : [SELECT Id, AccountId, Title, Name, Inactive__c 
+                          FROM Contact 
+                          WHERE AccountId IN :azAccountIds]) {
+            if (!existingContactsByAcct.containsKey(c.AccountId)) {
+                existingContactsByAcct.put(c.AccountId, new List<Contact>());
+            }
+            existingContactsByAcct.get(c.AccountId).add(c);
+        }
+
+        // 4. Parse the CSV and process the logic
+        String csvBody = csvResource.Body.toString();
+        String[] csvLines = csvBody.split('\n');
+        
+        List<Contact> contactsToCreate = new List<Contact>();
+        List<Contact> contactsToUpdate = new List<Contact>(); // For marking old ones inactive
+
+        for (Integer i = 1; i < csvLines.size(); i++) { // Skip header
+            String line = csvLines[i].trim();
+            if (String.isBlank(line)) continue;
+            
+            // Handle carriage returns
+            if (line.endsWith('\r')) {
+                line = line.substring(0, line.length() - 1);
+            }
+            
+            String[] csvRow = line.split(',');
+            if (csvRow.size() <= COL_TITLE) continue;
+
+            String cnn = csvRow[COL_CNN];
+            String adminName = csvRow[COL_NAME];
+            String adminTitle = csvRow[COL_TITLE];
+            
+            // Check if this CNN matches one of our AZ accounts
+            if (cnnToAccountId.containsKey(cnn)) {
+                Id currentAccountId = cnnToAccountId.get(cnn);
+                boolean alreadyExists = false;
+                
+                // Check existing contacts on this account
+                if (existingContactsByAcct.containsKey(currentAccountId)) {
+                    for (Contact existingContact : existingContactsByAcct.get(currentAccountId)) {
+                        
+                        // Requirement: Check if this *exact* person already exists
+                        if (existingContact.Name.contains(adminName) && existingContact.Title == adminTitle) {
+                            alreadyExists = true;
+                        }
+                        // Requirement: Mark old admins inactive
+                        else if (existingContact.Title == adminTitle && !existingContact.Name.contains(adminName)) {
+                            existingContact.Inactive__c = true;
+                            contactsToUpdate.add(existingContact);
+                            System.debug('Marking old admin ' + existingContact.Name + ' inactive.');
+                        }
+                    }
+                }
+                
+                // Requirement: Only create if they don't exist
+                if (!alreadyExists) {
+                    Contact newAdmin = new Contact();
+                    newAdmin.AccountId = currentAccountId;
+                    newAdmin.FirstName = getFirstName(adminName);
+                    newAdmin.LastName = getLastName(adminName);
+                    newAdmin.Title = adminTitle;
+                    
+                    // ** BONUS: Infer email address **
+                    newAdmin.Email = inferEmail(adminName);
+                    
+                    contactsToCreate.add(newAdmin);
+                    System.debug('Creating new admin ' + adminName);
+                }
+            }
+        }
+
+        // 5. Perform DML
+        if (!contactsToCreate.isEmpty()) {
+            Database.insert(contactsToCreate, false);
+        }
+        if (!contactsToUpdate.isEmpty()) {
+            Database.update(contactsToUpdate, false);
+        }
+
+        System.debug('Contact Importer finished. Created: ' + contactsToCreate.size() + '. Updated: ' + contactsToUpdate.size());
+    }
+    
+    // --- Helper functions for parsing names ---
+    
+    private String getFirstName(String fullName) {
+        if (String.isBlank(fullName)) return '';
+        String[] parts = fullName.split(' ');
+        return parts[0];
+    }
+    
+    private String getLastName(String fullName) {
+        if (String.isBlank(fullName)) return 'Unknown';
+        String[] parts = fullName.split(' ');
+        if (parts.size() > 1) {
+            return parts[parts.size() - 1];
+        }
+        return 'Unknown'; // Or just return the name if no space
+    }
+    
+    // ** BONUS: Simple email inference **
+    private String inferEmail(String fullName) {
+        if (String.isBlank(fullName)) return null;
+        String emailName = fullName.replaceAll(' ', '.').replaceAll('[^a-zA-Z0-9.]', '');
+        return emailName.toLowerCase() + '@example.com';
+    }
+}
